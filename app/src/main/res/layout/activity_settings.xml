@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <LinearLayout android:orientation="vertical"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="OpenRouter API Key (kept encrypted)" android:textStyle="bold"/>
+
+        <EditText android:id="@+id/editApiKey" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:hint="Paste API key here" android:inputType="textMultiLine"/>
+
+        <Button android:id="@+id/btnSaveApiKey" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:text="Save API Key" android:layout_marginTop="8dp"/>
+
+        <View android:layout_width="match_parent" android:layout_height="1dp" android:background="#DDD" android:layout_marginTop="16dp"/>
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Task execution preferences" android:textStyle="bold" android:layout_marginTop="12dp"/>
+
+        <LinearLayout android:orientation="horizontal" android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
+            <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Run heavy jobs only on Wi-Fi"/>
+            <Switch android:id="@+id/switchWifiOnly" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+        </LinearLayout>
+
+        <LinearLayout android:orientation="horizontal" android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
+            <TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Run heavy jobs only while charging"/>
+            <Switch android:id="@+id/switchChargingOnly" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+        </LinearLayout>
+
+        <Button android:id="@+id/btnStartFg" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Start Foreground Service" android:layout_marginTop="12dp"/>
+
+    </LinearLayout>
+</ScrollView>
