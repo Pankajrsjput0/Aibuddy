@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AI Agent</string>
+    <string name="accessibility_service_description">AI Agent Accessibility Service: required for automating actions on your behalf. You will be asked to explicitly enable this in Settings.</string>
+</resources>
