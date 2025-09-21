@@ -44,3 +44,42 @@ object NotificationHelper {
         nm.notify((System.currentTimeMillis() % 10000).toInt(), n)
     }
 }
+
+
+
+
+
+
+// existing imports & ensureChannel() present
+
+fun notifyConfirmation(
+    ctx: Context,
+    taskId: String,
+    stepId: Int,
+    message: String,
+    notifId: Int = (System.currentTimeMillis() % 10000).toInt()
+) {
+    ensureChannel(ctx)
+    val intent = Intent(ctx, ConfirmationActivity::class.java).apply {
+        putExtra(ConfirmationConstants.EXTRA_TASK_ID, taskId)
+        putExtra(ConfirmationConstants.EXTRA_STEP_ID, stepId)
+        putExtra(ConfirmationConstants.EXTRA_MESSAGE, message)
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+    }
+    val pi = PendingIntent.getActivity(
+        ctx, notifId, intent,
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    val n = NotificationCompat.Builder(ctx, "ai_agent_channel")
+        .setContentTitle("Action confirmation required")
+        .setContentText(message)
+        .setSmallIcon(android.R.drawable.ic_dialog_alert)
+        .setAutoCancel(true)
+        .setContentIntent(pi)
+        .addAction(android.R.drawable.ic_menu_send, "Open to confirm", pi)
+        .build()
+
+    val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+    nm.notify(notifId, n)
+}
