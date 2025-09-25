@@ -26,6 +26,8 @@
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
+<activity android:name=".ConfirmationActivity" android:exported="false"/>
+
         <!-- Main activity -->
         <activity android:name=".MainActivity"
             android:exported="true">
