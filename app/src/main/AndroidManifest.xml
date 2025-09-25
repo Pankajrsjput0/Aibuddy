@@ -41,6 +41,7 @@
             android:exported="false" />
 
         <!-- Accessibility service -->
+<service android:name=".HotwordService" android:exported="false"/>
         <service
             android:name=".AgentAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
