@@ -18,14 +18,21 @@ class TaskExecutor(private val context: Context) {
 
             for (i in startIndex until planArr.length()) {
                 val step = planArr.getJSONObject(i)
-                val requires = step.optBoolean("requires_confirmation", false)
-                if (requires) {
-                    val ok = BiometricUtils.requestConfirmation(context, step.optString("description"))
+                val stepId = "${taskId}_step_$i"
+                
+                if (step.optBoolean("requires_confirmation", false)) {
+                    val ok = requestUserConfirmationViaNotification(
+                        context, 
+                        taskId, 
+                        stepId, 
+                        step.optString("description")
+                    )
                     if (!ok) {
                         writeCheckpoint(checkpointFile, i, "skipped_by_user")
                         return@launch
                     }
                 }
+                
                 val result = executeStep(step)
                 writeCheckpoint(checkpointFile, i, if (result) "done" else "failed")
                 if (!result) {
@@ -34,6 +41,32 @@ class TaskExecutor(private val context: Context) {
                 }
             }
             writeCheckpoint(checkpointFile, planArr.length(), "completed")
+        }
+    }
+
+    private suspend fun requestUserConfirmationViaNotification(
+        context: Context, 
+        taskId: String, 
+        stepId: String, 
+        description: String
+    ): Boolean = withContext(Dispatchers.Main) {
+        return@withContext suspendCancellableCoroutine { continuation ->
+            try {
+                NotificationHelper.showConfirmationNotification(
+                    context,
+                    taskId,
+                    stepId,
+                    description
+                ) { approved ->
+                    if (continuation.isActive) {
+                        continuation.resume(approved)
+                    }
+                }
+            } catch (e: Exception) {
+                if (continuation.isActive) {
+                    continuation.resume(false)
+                }
+            }
         }
     }
 
@@ -89,6 +122,13 @@ class TaskExecutor(private val context: Context) {
         val j = JSONObject()
         j.put("last_step", stepIndex)
         j.put("status", status)
+        j.put("timestamp", System.currentTimeMillis())
         file.writeText(j.toString())
+    }
+
+    fun cancelTask(taskId: String) {
+        scope.coroutineContext[Job]?.let { job ->
+            job.cancel()
+        }
     }
 }
