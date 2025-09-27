@@ -1,7 +1,9 @@
 package com.example.aiagent
 
+import android.content.Context
 import okhttp3.*
 import okhttp3.logging.HttpLoggingInterceptor
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -18,28 +20,56 @@ object OpenRouterClient {
         client = OkHttpClient.Builder().addInterceptor(logging).build()
     }
 
-    suspend fun requestPlanner(apiKey: String, prompt: String, model: String = "oai/gpt-4o-mini"): JSONObject =
+    // Load system prompt from assets
+    private fun loadSystemPrompt(context: Context): String {
+        return context.assets.open("system_prompt.txt")
+            .bufferedReader().use { it.readText() }
+    }
+
+    suspend fun sendMessage(
+        context: Context,
+        apiKey: String,
+        userMessage: String,
+        model: String = "oai/gpt-4o-mini"
+    ): JSONObject =
         suspendCancellableCoroutine { cont ->
-            val url = "https://api.openrouter.ai/v1/chat/completions"
+            val url = "https://openrouter.ai/api/v1/chat/completions"
+
+            val messages = JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "system")
+                    put("content", loadSystemPrompt(context))
+                })
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", userMessage)
+                })
+            }
+
             val bodyJson = JSONObject().apply {
                 put("model", model)
-                put("input", prompt)
-                put("max_new_tokens", 800)
+                put("messages", messages)
+                put("max_tokens", 800)
                 put("stream", false)
             }.toString()
+
             val request = Request.Builder()
                 .url(url)
                 .post(RequestBody.create(JSON, bodyJson))
                 .addHeader("Authorization", "Bearer $apiKey")
                 .build()
-            client.newCall(request).enqueue(object: Callback {
+
+            client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     if (cont.isActive) cont.resumeWithException(e)
                 }
+
                 override fun onResponse(call: Call, response: Response) {
                     response.use {
                         if (!it.isSuccessful) {
-                            if (cont.isActive) cont.resumeWithException(IOException("Unexpected code ${it.code}"))
+                            if (cont.isActive) cont.resumeWithException(
+                                IOException("Unexpected code ${it.code}")
+                            )
                             return
                         }
                         val txt = it.body!!.string()
