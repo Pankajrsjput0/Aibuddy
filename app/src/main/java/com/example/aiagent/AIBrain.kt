@@ -14,12 +14,25 @@ class AIBrain(private val context: Context) {
         OpenRouterClient.requestPlanner(apiKey, prompt)
     }
 
-    private fun buildPlannerPrompt(goal: String): String {
-        return """
-SYSTEM: You are an autonomous assistant that outputs ONLY valid JSON following this schema:
-{ "task_id":"<id>", "goal":"...", "plan":[{ "step_id":1, "type":"open_app|web_visit|click|fill|generate_text|save_file|screenshot|wait|confirm_user", "description":"", "params":{}, "requires_confirmation":false }], "fallback":[], "metadata":{} }
+    // ✅ This reads system_prompt.txt from assets folder
+    private fun loadSystemPrompt(): String {
+        return try {
+            context.assets.open("system_prompt.txt").bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            "You are a helpful AI assistant." // fallback if file not found
+        }
+    }
 
-USER GOAL: "$goal"
+    // ✅ Now it includes the system prompt + user goal
+    private fun buildPlannerPrompt(goal: String): String {
+        val systemPrompt = loadSystemPrompt()
+
+        return """
+SYSTEM PROMPT:
+$systemPrompt
+
+USER GOAL:
+"$goal"
 
 CONSTRAINTS:
 - This device has Accessibility, Web automation via Accessibility, TTS, File IO.
