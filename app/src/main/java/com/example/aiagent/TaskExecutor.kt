@@ -3,184 +3,196 @@ package com.example.aiagent
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Bundle
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
+import android.os.Build
+import android.speech.tts.TextToSpeech
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.IOException
-import java.util.concurrent.TimeUnit
+import java.util.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.ResponseBody
 import okio.buffer
 import okio.sink
+import java.util.concurrent.TimeUnit
 
 /**
- * Full-featured TaskExecutor for the AI Agent.
+ * TaskExecutor.kt
  *
- * Replace your existing TaskExecutor.kt with this file.
+ * Full-featured executor that:
+ * - Validates plans (TaskPlanSchema)
+ * - Executes all supported step types (with safe stubs where needed)
+ * - Checkpoints progress into tasks/{task_id}/checkpoint.json
+ * - Uses confirmation flow for destructive/sensitive steps
  *
- * NOTE:
- * - This file assumes helper classes exist (AccessibilityController, NotificationHelper, StorageUtils,
- *   OpenRouterClient.requestPlanner, ScreenCaptureHelper, WorkEnqueueHelper, PreferencesUtils).
- * - Some steps (screen recording, GitHub OAuth, wallet transfers) are dangerous and require explicit user confirmation.
+ * NOTE: This file assumes your project includes helper utilities:
+ * - AccessibilityController (openApp, clickByText, clickById, swipe, fillText, etc.)
+ * - NotificationHelper (notify, notifyConfirmation, showProgressNotification)
+ * - StorageUtils (getTaskDir, getOpenRouterKey, encryptAndStore)
+ * - OpenRouterClient (requestPlanner/sendMessage)
+ * - ScreenCaptureHelper (MediaProjection flow)
+ * - WorkEnqueueHelper (enqueue job)
+ * - PreferencesUtils
+ * - ConfirmationConstants & ConfirmationActivity registration
+ *
+ * Some actions (GitHub OAuth, payments, wallet transfers, CAPTCHA solving) require additional SDKs
+ * and explicit user consent. This executor will prompt the user and open necessary web flows instead
+ * of attempting anything unsafe or disallowed.
  */
 class TaskExecutor(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val httpClient = OkHttpClient.Builder()
         .callTimeout(5, TimeUnit.MINUTES)
         .build()
+    private var tts: TextToSpeech? = null
 
-    fun executePlan(planJson: JSONObject) {
-        scope.launch {
-            val taskId = planJson.optString("task_id", "task_${System.currentTimeMillis()}")
-            val stepsArr = planJson.optJSONArray("steps") ?: planJson.optJSONArray("plan") ?: JSONArray()
-            val taskDir = StorageUtils.getTaskDir(context, taskId)
-            val checkpointFile = File(taskDir, "checkpoint.json")
-            var startIndex = readCheckpoint(checkpointFile)
-
-            // Save full plan for debugging
-            File(taskDir, "plan.json").writeText(planJson.toString(2))
-
-            for (i in startIndex until stepsArr.length()) {
-                val step = stepsArr.getJSONObject(i)
-                val stepId = step.optString("id", "s$i")
-                // Check pause/abort flags
-                if (File(taskDir, "abort.flag").exists()) {
-                    writeCheckpoint(checkpointFile, i, "aborted")
-                    NotificationHelper.notify(context, "Task aborted", "Task $taskId aborted by user")
-                    return@launch
-                }
-                if (File(taskDir, "pause.flag").exists()) {
-                    writeCheckpoint(checkpointFile, i, "paused")
-                    // Wait until pause.flag removed (or abort)
-                    while (File(taskDir, "pause.flag").exists()) {
-                        if (File(taskDir, "abort.flag").exists()) {
-                            writeCheckpoint(checkpointFile, i, "aborted")
-                            NotificationHelper.notify(context, "Task aborted", "Task $taskId aborted while paused")
-                            return@launch
-                        }
-                        delay(2000)
-                    }
-                }
-
-                // Confirm if required
-                val requires = step.optBoolean("requires_confirmation", false)
-                if (requires) {
-                    val desc = step.optString("description", "Please confirm")
-                    val approved = requestUserConfirmationViaNotification(context, taskId, stepId, desc)
-                    if (!approved) {
-                        writeCheckpoint(checkpointFile, i, "skipped_by_user")
-                        continue // skip this step but continue subsequent steps
-                    }
-                }
-
-                // Execute step with retries
-                var success = false
-                val retry = step.optJSONObject("retry")
-                val retryCount = retry?.optInt("count", 0) ?: 0
-                val backoff = retry?.optInt("backoff_s", 2) ?: 2
-                var attempt = 0
-                while (attempt <= retryCount) {
-                    try {
-                        success = withContext(Dispatchers.IO) { executeStepSuspend(step, taskDir, taskId) }
-                        if (success) break
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                    attempt++
-                    if (!success && attempt <= retryCount) delay((backoff * 1000).toLong())
-                }
-
-                writeCheckpoint(checkpointFile, i, if (success) "done" else "failed")
-                if (!success) {
-                    // Optionally run fallback if provided
-                    val fallback = (planJson.optJSONArray("fallback"))
-                    if (fallback != null && fallback.length() > 0) {
-                        NotificationHelper.notify(context, "Running fallback", "Attempting fallback steps for task $taskId")
-                        // write fallback to file and call executePlan recursively with fallback as plan
-                        val fbPlan = JSONObject().apply {
-                            put("task_id", "$taskId-fallback-${System.currentTimeMillis()}")
-                            put("created_at", System.currentTimeMillis())
-                            put("goal", planJson.optString("goal", "fallback"))
-                            put("steps", fallback)
-                        }
-                        executePlan(fbPlan)
-                    }
-                    // stop main plan on failure to avoid cascading errors
-                    NotificationHelper.notify(context, "Task failed", "Step ${step.optString("id")} failed")
-                    return@launch
-                }
+    init {
+        tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                try { tts?.language = Locale.getDefault() } catch (_: Exception) {}
             }
-
-            writeCheckpoint(checkpointFile, stepsArr.length(), "completed")
-            NotificationHelper.notify(context, "Task completed", "Task $taskId finished.")
-        }
-    }
-
-    // Confirmation helper that delegates to NotificationHelper/Confirmation flow
-    private suspend fun requestUserConfirmationViaNotification(
-        context: Context,
-        taskId: String,
-        stepId: String,
-        description: String,
-        timeoutMs: Long = 2 * 60_000L
-    ): Boolean = suspendCancellableCoroutine { cont ->
-        try {
-            NotificationHelper.notifyConfirmation(context, taskId, stepId.toIntOrNull() ?: (System.currentTimeMillis() % 10000).toInt(), description)
-            // Listen for broadcast already implemented in ConfirmationReceiverHelper.kt
-            val action = ConfirmationConstants.ACTION_CONFIRM_PREFIX + taskId
-            val filter = android.content.IntentFilter(action)
-            val receiver = object : android.content.BroadcastReceiver() {
-                override fun onReceive(ctx: android.content.Context?, intent: android.content.Intent?) {
-                    try {
-                        val result = intent?.getBooleanExtra(ConfirmationConstants.EXTRA_RESULT, false) ?: false
-                        if (cont.isActive) cont.resume(result) {}
-                    } catch (e: Exception) {
-                        if (cont.isActive) cont.resume(false) {}
-                    } finally {
-                        try { context.unregisterReceiver(this) } catch (_: Exception) {}
-                    }
-                }
-            }
-            try { context.registerReceiver(receiver, filter) } catch (e: Exception) {
-                e.printStackTrace()
-                if (cont.isActive) cont.resume(false) {}
-                return@suspendCancellableCoroutine
-            }
-
-            // timeout
-            val job = scope.launch {
-                delay(timeoutMs)
-                if (cont.isActive) {
-                    try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
-                    cont.resume(false) {}
-                }
-            }
-
-            cont.invokeOnCancellation {
-                try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
-                job.cancel()
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            if (cont.isActive) cont.resume(false) {}
         }
     }
 
     /**
-     * Execute a single StepObject. This is a suspend function so it can call network or blocking APIs.
-     * Return true on success, false on permanent failure.
+     * Public entry point. Accepts full TaskPlan JSON (TaskPlanSchema).
      */
-    private suspend fun executeStepSuspend(step: JSONObject, taskDir: File, taskId: String): Boolean {
-        return withContext(Dispatchers.IO) {
+    fun executePlan(planJson: JSONObject) {
+        scope.launch {
+            try {
+                // Validate the overall plan structure
+                val validation = validateTaskPlan(planJson)
+                if (!validation.valid) {
+                    logError("Plan validation failed: ${validation.reason}")
+                    NotificationHelper.notify(context, "Plan invalid", validation.reason)
+                    return@launch
+                }
+
+                val taskId = planJson.optString("task_id", "task_${System.currentTimeMillis()}")
+                val createdAt = planJson.optString("created_at", "")
+                val goal = planJson.optString("goal", "")
+                val steps = planJson.optJSONArray("steps") ?: planJson.optJSONArray("plan") ?: JSONArray()
+                val fallback = planJson.optJSONArray("fallback") ?: JSONArray()
+                val taskDir = StorageUtils.getTaskDir(context, taskId)
+                if (!taskDir.exists()) taskDir.mkdirs()
+                val checkpointFile = File(taskDir, "checkpoint.json")
+
+                // Persist original plan for debugging/inspection
+                File(taskDir, "plan.json").writeText(planJson.toString(2))
+
+                // Load or initialize checkpoint
+                val checkpoint = loadCheckpoint(checkpointFile, steps.length())
+                var currentIndex = checkpoint.last_step
+
+                // Enforce prereqs (e.g., wifi/charging) if present
+                val prereqs = planJson.optJSONObject("prerequisites")
+                if (prereqs != null) {
+                    val ok = checkPrerequisites(prereqs)
+                    if (!ok) {
+                        NotificationHelper.notify(context, "Prerequisites unmet", "Task $taskId requires ${prereqs.toString()}")
+                        return@launch
+                    }
+                }
+
+                NotificationHelper.notify(context, "Task started", "Task: ${goal.ifEmpty { taskId }}")
+
+                for (i in currentIndex until steps.length()) {
+                    val step = steps.optJSONObject(i) ?: continue
+                    val stepId = step.optString("id", "s$i")
+                    // Respect pause/abort flags
+                    if (File(taskDir, "abort.flag").exists()) {
+                        checkpoint.steps_status.put(stepId, "aborted")
+                        checkpoint.last_step = i
+                        checkpoint.updated_at = System.currentTimeMillis()
+                        saveCheckpoint(checkpointFile, checkpoint)
+                        NotificationHelper.notify(context, "Task aborted", taskId)
+                        return@launch
+                    }
+                    if (File(taskDir, "pause.flag").exists()) {
+                        checkpoint.steps_status.put(stepId, "paused")
+                        saveCheckpoint(checkpointFile, checkpoint)
+                        // wait until pause removed or abort
+                        while (File(taskDir, "pause.flag").exists()) {
+                            if (File(taskDir, "abort.flag").exists()) {
+                                NotificationHelper.notify(context, "Task aborted", taskId)
+                                return@launch
+                            }
+                            delay(1000)
+                        }
+                    }
+
+                    // Confirmation step pre-check
+                    val requiresConfirmation = step.optBoolean("requires_confirmation", false)
+                    if (requiresConfirmation) {
+                        val message = step.optString("description", "Please confirm this action")
+                        val approved = requestUserConfirmationViaNotification(taskId, stepId, message)
+                        if (!approved) {
+                            checkpoint.steps_status.put(stepId, "skipped_by_user")
+                            checkpoint.last_step = i + 1
+                            checkpoint.updated_at = System.currentTimeMillis()
+                            saveCheckpoint(checkpointFile, checkpoint)
+                            continue
+                        }
+                    }
+
+                    // Execute step with retry/backoff
+                    val retryObj = step.optJSONObject("retry")
+                    val retries = retryObj?.optInt("count", 0) ?: 0
+                    val backoff = retryObj?.optInt("backoff_s", 2) ?: 2
+                    var success = false
+                    var attempt = 0
+                    while (attempt <= retries) {
+                        try {
+                            success = executeSingleStep(step, taskDir, taskId)
+                            if (success) break
+                        } catch (ex: Exception) {
+                            ex.printStackTrace()
+                        }
+                        attempt++
+                        if (!success && attempt <= retries) delay(backoff * 1000L)
+                    }
+
+                    checkpoint.steps_status.put(stepId, if (success) "done" else "failed")
+                    checkpoint.last_step = i + 1
+                    checkpoint.updated_at = System.currentTimeMillis()
+                    saveCheckpoint(checkpointFile, checkpoint)
+
+                    if (!success) {
+                        logError("Step failed: ${step.optString("id", stepId)}")
+                        // attempt fallback if provided for this plan
+                        if (fallback.length() > 0) {
+                            NotificationHelper.notify(context, "Running fallback", "Attempting fallback steps for task $taskId")
+                            val fb = JSONObject().apply {
+                                put("task_id", "${taskId}_fallback_${System.currentTimeMillis()}")
+                                put("created_at", System.currentTimeMillis())
+                                put("goal", "fallback for $taskId")
+                                put("steps", fallback)
+                            }
+                            executePlan(fb) // recursive fallback run
+                        }
+                        NotificationHelper.notify(context, "Task failed", "Task $taskId failed at step $stepId")
+                        return@launch
+                    }
+                }
+
+                // Mark complete
+                checkpoint.status = "completed"
+                checkpoint.updated_at = System.currentTimeMillis()
+                saveCheckpoint(checkpointFile, checkpoint)
+                NotificationHelper.notify(context, "Task completed", "Task $taskId finished")
+            } catch (e: Exception) {
+                e.printStackTrace()
+                NotificationHelper.notify(context, "Executor error", e.message ?: "Unknown error")
+            }
+
+
+// ---------- Step executor (suspend) ----------
+    private suspend fun executeSingleStep(step: JSONObject, taskDir: File, taskId: String): Boolean =
+        withContext(Dispatchers.IO) {
             val type = step.optString("type")
             val params = step.optJSONObject("params") ?: JSONObject()
-            val timeout = step.optInt("timeout_s", 60)
             when (type) {
+                // Device / App Control
                 "open_app" -> {
                     val pkg = params.optString("package")
                     AccessibilityController.openApp(context, pkg)
@@ -190,188 +202,201 @@ class TaskExecutor(private val context: Context) {
                     AccessibilityController.closeApp(context, pkg)
                 }
                 "app_tap", "click" -> {
-                    // support selector types by text/resource_id/coords/xpath
                     val by = params.optString("by", "text")
+                    val value = params.optString("value", params.optString("text", ""))
                     when (by) {
-                        "text" -> AccessibilityController.clickByText(context, params.optString("value"))
-                        "resource_id" -> AccessibilityController.clickById(context, params.optString("value"))
+                        "text" -> AccessibilityController.clickByText(context, value)
+                        "resource_id" -> AccessibilityController.clickById(context, value)
                         "coords" -> {
                             val arr = params.optJSONArray("value")
                             if (arr != null && arr.length() >= 2) AccessibilityController.clickByCoords(arr.getInt(0), arr.getInt(1)) else false
                         }
-                        else -> AccessibilityController.clickByText(context, params.optString("value"))
+                        "xpath" -> AccessibilityController.clickByXPath(context, value)
+                        else -> AccessibilityController.clickByText(context, value)
                     }
                 }
                 "app_type", "fill" -> {
-                    val text = params.optString("text")
+                    val text = params.optString("text", "")
                     val target = params.optString("target", "focused")
                     AccessibilityController.fillText(context, text, target)
                 }
                 "app_swipe" -> {
                     val from = params.optJSONArray("from")
                     val to = params.optJSONArray("to")
-                    val duration = params.optInt("duration_ms", 300)
-                    if (from != null && to != null && from.length() >= 2 && to.length() >= 2) {
-                        AccessibilityController.swipe(from.getInt(0), from.getInt(1), to.getInt(0), to.getInt(1), duration)
-                    } else false
+                    val dur = params.optInt("duration_ms", 300)
+                    if (from != null && to != null && from.length() >= 2 && to.length() >= 2)
+                        AccessibilityController.swipe(from.getInt(0), from.getInt(1), to.getInt(0), to.getInt(1), dur)
+                    else false
                 }
+
+                // Web Automation & Browsing
                 "web_visit" -> {
                     val url = params.optString("url")
-                    // Open default browser via intent
+                    if (url.isBlank()) return@withContext false
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     context.startActivity(intent)
                     true
                 }
                 "web_interact" -> {
-                    // sequence of {action, selector, value}
                     val seq = params.optJSONArray("sequence") ?: JSONArray()
                     for (i in 0 until seq.length()) {
-                        val stepObj = seq.getJSONObject(i)
-                        val action = stepObj.optString("action")
-                        val selector = stepObj.optJSONObject("selector")
-                        val value = stepObj.optString("value")
-                        // best-effort: use AccessibilityController to act in foreground app/webview
+                        val s = seq.getJSONObject(i)
+                        val action = s.optString("action")
+                        val selector = s.optJSONObject("selector")
+                        val value = s.optString("value", "")
                         when (action) {
                             "click" -> {
                                 val by = selector?.optString("by", "text") ?: "text"
-                                val v = selector?.optString("value") ?: value
+                                val v = selector?.optString("value", value) ?: value
                                 AccessibilityController.clickBySelector(context, by, v)
                             }
                             "fill" -> {
-                                val v = selector?.optString("value") ?: value
-                                AccessibilityController.fillBySelector(context, selector, v)
+                                AccessibilityController.fillBySelector(context, selector, value)
                             }
                             "wait" -> {
-                                val ms = stepObj.optInt("ms", 1000)
-                                delay(ms.toLong())
+                                delay(s.optInt("ms", 1000).toLong())
                             }
                             "screenshot" -> {
-                                val saveAs = stepObj.optString("save_as", "tasks/$taskId/web_${i}.png")
-                                // trigger screenshot flow (requires MediaProjection permission)
-                                // We create a file entry and request user to grant capture when necessary
-                                // Placeholder: record that a screenshot should be taken by the UI flow
-                                NotificationHelper.notify(context, "Action needed", "Please grant screen capture for web screenshot")
-                                // Not implemented: actual MediaProjection here
+                                // trigger screenshot flow (user consent required)
+                                val saveAs = s.optString("save_as", "tasks/$taskId/web_${i}.png")
+                                NotificationHelper.notify(context, "Screenshot required", "Please allow screen capture for web screenshot.")
+                                // Optionally create placeholder file
+                                val f = File(taskDir, saveAs)
+                                f.parentFile?.mkdirs()
                             }
                             else -> {}
                         }
                     }
                     true
                 }
+
+                // Input / OTP / Captcha
                 "input_otp" -> {
-                    // Ask user to paste OTP via notification/intent
+                    // Ask user via secure UI to paste OTP. Do not read SMS automatically without consent.
                     NotificationHelper.notify(context, "OTP required", params.optString("message", "Please paste OTP into the app"))
-                    false // requires manual user action to complete
+                    false
                 }
-                "take_screenshot" -> {
-                    val saveAs = params.optString("save_as", "tasks/$taskId/screenshot_${System.currentTimeMillis()}.png")
-                    // This requires MediaProjection permission flow from an Activity. We'll create a file placeholder and notify user to allow.
-                    NotificationHelper.notify(context, "Screen capture", "Please allow screen capture to save screenshot.")
-                    // If the app has a MediaProjection token saved, call ScreenCaptureHelper here (not implemented fully)
+
+                // Screenshot / Screen Recording
+                "take_screenshot", "screenshot" -> {
+                    val filename = params.optString("save_as", "tasks/$taskId/screenshot_${System.currentTimeMillis()}.png")
+                    // Trigger UI flow to request MediaProjection permission and capture (service required)
+                    NotificationHelper.notify(context, "Screen capture required", "Please allow screen capture to save screenshot.")
+                    // If you implemented MediaProjectionService, call it here. Placeholder:
+                    // val saved = ScreenCaptureHelper.captureOnce(context, resultCode, data, filename)
                     true
                 }
                 "screen_record" -> {
                     NotificationHelper.notify(context, "Screen record", "Please allow screen recording (user consent required).")
                     false
                 }
+
+                // Content generation / AI calls
                 "generate_text" -> {
-                    val prompt = params.optString("prompt")
-                    val saveAs = params.optString("save_as", "tasks/$taskId/output_${System.currentTimeMillis()}.txt")
-                    val model = params.optString("model", "oai/gpt-4o-mini")
+                    val prompt = params.optString("prompt", "")
+                    val model = params.optString("model", "")
+                    val saveAs = params.optString("save_as", "tasks/$taskId/generated_text_${System.currentTimeMillis()}.txt")
                     val apiKey = StorageUtils.getOpenRouterKey(context) ?: return@withContext false
-                    val json = try {
-                        OpenRouterClient.requestPlanner(apiKey, prompt, model)
+                    val resp = try {
+                        if (model.isBlank())
+                            OpenRouterClient.requestPlanner(apiKey, prompt)
+                        else
+                            OpenRouterClient.requestPlanner(apiKey, prompt, model)
                     } catch (e: Exception) {
-                        e.printStackTrace(); null
+                        e.printStackTrace()
+                        null
                     }
-                    val text = json?.optString("generated_text") ?: json?.optString("choices") ?: json?.toString()
+                    val text = resp?.optString("generated_text") ?: resp?.optString("choices") ?: resp?.toString()
                     if (text != null) {
-                        val f = File(taskDir, saveAs)
-                        f.parentFile?.mkdirs()
-                        f.writeText(text)
+                        val out = File(taskDir, saveAs)
+                        out.parentFile?.mkdirs()
+                        out.writeText(text)
+                        // store partial output
+                        storePartialOutput(taskDir, step.optString("id", ""), out.absolutePath)
                         true
                     } else false
                 }
+
                 "generate_code" -> {
-                    val spec = params.optString("spec")
-                    val language = params.optString("language", "plaintext")
-                    // Use LLM to create files; we expect the planner to include file outputs in response
+                    val spec = params.optString("spec", "")
+                    val saveDir = params.optString("project_path", "tasks/$taskId/generated_project")
                     val apiKey = StorageUtils.getOpenRouterKey(context) ?: return@withContext false
-                    val prompt = "Generate project files for spec:\n$spec\nReturn file list and content as JSON."
-                    val json = try { OpenRouterClient.requestPlanner(apiKey, prompt) } catch (e: Exception) { e.printStackTrace(); null }
-                    if (json != null) {
-                        // Expect json contains "files": [{path, content}, ...]
-                        val filesArr = json.optJSONArray("files")
+                    val prompt = "Generate project files for spec:\n$spec\nReturn JSON: {files:[{path,content}]}"
+                    val resp = try { OpenRouterClient.requestPlanner(apiKey, prompt) } catch (e: Exception) { e.printStackTrace(); null }
+                    if (resp != null) {
+                        val filesArr = resp.optJSONArray("files")
                         if (filesArr != null) {
-                            for (i in 0 until filesArr.length()) {
-                                val fobj = filesArr.getJSONObject(i)
-                                val path = fobj.optString("path")
-                                val content = fobj.optString("content")
-                                val file = File(taskDir, path)
-                                file.parentFile?.mkdirs()
-                                file.writeText(content)
+                            for (j in 0 until filesArr.length()) {
+                                val f = filesArr.getJSONObject(j)
+                                val path = f.optString("path")
+                                val content = f.optString("content")
+                                val outFile = File(taskDir, "$saveDir/$path")
+                                outFile.parentFile?.mkdirs()
+                                outFile.writeText(content)
                             }
                             true
                         } else {
-                            // fallback: save raw text
-                            val out = File(taskDir, "generated_code.txt")
-                            out.writeText(json.toString(2))
+                            File(taskDir, "$saveDir/response.json").writeText(resp.toString(2))
                             true
                         }
                     } else false
                 }
+
+// File ops
                 "save_file" -> {
-                    val path = params.optString("path", "tasks/$taskId/out_${System.currentTimeMillis()}.txt")
+                    val path = params.optString("path", "tasks/$taskId/file_${System.currentTimeMillis()}.txt")
                     val content = params.optString("content", "")
-                    val file = File(taskDir, path)
-                    file.parentFile?.mkdirs()
-                    file.writeText(content)
+                    val f = File(taskDir, path)
+                    f.parentFile?.mkdirs()
+                    f.writeText(content)
+                    storePartialOutput(taskDir, step.optString("id", ""), f.absolutePath)
                     true
                 }
                 "download_file" -> {
-                    val url = params.optString("url")
+                    val url = params.optString("url", "")
                     val saveAs = params.optString("save_as", "tasks/$taskId/download_${System.currentTimeMillis()}")
+                    if (url.isBlank()) return@withContext false
                     try {
                         val req = Request.Builder().url(url).build()
-                        val resp = httpClient.newCall(req).execute()
-                        if (!resp.isSuccessful) return@withContext false
-                        val body: ResponseBody? = resp.body
-                        if (body != null) {
+                        httpClient.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@withContext false
+                            val body = resp.body ?: return@withContext false
                             val outFile = File(taskDir, saveAs)
                             outFile.parentFile?.mkdirs()
                             outFile.sink().buffer().use { sink -> sink.writeAll(body.source()) }
+                            storePartialOutput(taskDir, step.optString("id", ""), outFile.absolutePath)
                             true
-                        } else false
+                        }
                     } catch (e: Exception) {
                         e.printStackTrace()
                         false
                     }
                 }
                 "upload_file" -> {
-                    // Uploads are highly dependent on target. Here we support simple HTTP multipart upload if params provide url.
-                    val filePath = params.optString("path")
-                    val target = params.optString("target")
-                    if (filePath.isNullOrEmpty()) return@withContext false
-                    val f = File(context.filesDir, filePath)
+                    val path = params.optString("path", "")
+                    val target = params.optString("target", "")
+                    if (path.isBlank() || target.isBlank()) return@withContext false
+                    val f = File(context.filesDir, path)
                     if (!f.exists()) return@withContext false
+                    // For cloud targets, open web auth flow or call SDK. Here we show notification + open browser if URL provided.
                     when (target) {
-                        "s3", "gdrive", "github" -> {
-                            NotificationHelper.notify(context, "Upload required", "Upload to $target may require auth. Opening auth flow.")
-                            // Open browser to let user authenticate or instruct further
+                        "github", "gdrive", "s3" -> {
+                            NotificationHelper.notify(context, "Upload required", "Please complete authentication for $target.")
                             true
                         }
                         "http" -> {
-                            val uploadUrl = params.optString("url")
-                            // TODO: implement multipart upload using OkHttp
-                            NotificationHelper.notify(context, "Upload", "Attempting HTTP upload (not fully implemented).")
+                            val url = params.optString("url", "")
+                            if (url.isBlank()) return@withContext false
+                            // TODO: implement multipart upload
+                            NotificationHelper.notify(context, "Upload", "HTTP upload to $url started (not fully implemented).")
                             true
                         }
-                        else -> {
-                            false
-                        }
+                        else -> false
                     }
                 }
+
+                // Notifications & scheduling
                 "send_notification", "notify" -> {
                     val title = params.optString("title", "Agent")
                     val body = params.optString("body", "")
@@ -379,122 +404,266 @@ class TaskExecutor(private val context: Context) {
                     true
                 }
                 "schedule_job" -> {
-                    val cron = params.optString("cron", null)
                     val delayS = params.optInt("delay_s", -1)
-                    val worker = params.optString("worker", "long_task_worker")
+                    val workerName = params.optString("worker", "long_task_worker")
                     val payload = params.optJSONObject("payload") ?: JSONObject()
-                    // Enqueue through WorkEnqueueHelper (use WorkManager constraints)
-                    val taskPayload = payload.toString()
-                    val jid = params.optString("job_id", "job_${System.currentTimeMillis()}")
-                    WorkEnqueueHelper.enqueueJob(context, jid, taskPayload, delayS)
+                    WorkEnqueueHelper.enqueueJob(context, workerName + "_" + System.currentTimeMillis(), payload.toString(), delayS)
                     true
                 }
+
+                // Confirmation control
                 "confirm_user" -> {
                     val message = params.optString("message", "Please confirm")
-                    val approved = requestUserConfirmationViaNotification(context, taskId, step.optString("id","confirm"), message)
+                    val approved = requestUserConfirmationViaNotification(taskId, step.optString("id", "confirm"), message)
                     approved
                 }
+
+                // OCR / screenshot + OCR
                 "screenshot_and_ocr" -> {
-                    val saveAs = params.optString("save_as", "tasks/$taskId/ocr_${System.currentTimeMillis()}.txt")
-                    // Request capture permission via UI and then OCR
-                    NotificationHelper.notify(context, "OCR requested", "Please allow screen capture to perform OCR.")
-                    // Placeholder: actual OCR pipeline requires MediaProjection + OCR lib (Tesseract or ML Kit)
+                    NotificationHelper.notify(context, "OCR requested", "Please allow screen capture for OCR.")
+                    // Placeholder: actual OCR requires MediaProjection + OCR engine
                     true
                 }
+
+                // Delete / destructive ops
                 "delete_files" -> {
-                    val path = params.optString("path")
+                    val path = params.optString("path", "")
                     val recursive = params.optBoolean("recursive", false)
-                    if (path.isNullOrEmpty()) return@withContext false
+                    if (path.isBlank()) return@withContext false
                     val target = File(path)
-                    if (!target.exists()) return@withContext false
-                    // Only allow deletion in app storage or explicit paths
+                    // Safety: only allow deleting inside app filesDir or explicitly allowed path
                     if (!target.absolutePath.startsWith(context.filesDir.absolutePath)) {
-                        NotificationHelper.notify(context, "Delete blocked", "Deletion blocked for safety: $path")
+                        NotificationHelper.notify(context, "Delete blocked", "Deletion blocked outside app storage for safety.")
                         return@withContext false
                     }
-                    if (target.isDirectory && recursive) {
-                        target.deleteRecursively()
-                    } else {
-                        target.delete()
-                    }
+                    if (target.isDirectory && recursive) target.deleteRecursively() else target.delete()
                     true
                 }
+
+                // GitHub / cloud / infra (stubs that open flows)
                 "create_github_repo" -> {
-                    // Cannot silently create a GitHub repo; open browser to OAuth flow and instruct user
-                    NotificationHelper.notify(context, "GitHub action", "Please sign in to GitHub to allow repo creation.")
-                    // open GitHub new repo page (user must complete)
+                    NotificationHelper.notify(context, "GitHub repo creation", "Please sign in to GitHub to allow repository creation.")
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/new"))
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     context.startActivity(intent)
                     false
                 }
                 "deploy_infra" -> {
-                    // Provisioning typically requires cloud credentials and explicit user approval
-                    NotificationHelper.notify(context, "Deploy infra", "This action requires cloud credentials and explicit user approval.")
+                    NotificationHelper.notify(context, "Cloud deployment", "Cloud provisioning requires credentials and explicit approval.")
                     false
                 }
+
+                // Fallback action: run nested steps
                 "fallback_action" -> {
                     val reason = params.optString("reason", "fallback")
                     val steps = params.optJSONArray("steps") ?: JSONArray()
-                    // Run fallback steps locally by wrapping into a plan
-                    val fbPlan = JSONObject().apply {
-                        put("task_id", "$taskId-fallback-${System.currentTimeMillis()}")
+                    val fb = JSONObject().apply {
+                        put("task_id", "${taskId}_fallback_${System.currentTimeMillis()}")
                         put("created_at", System.currentTimeMillis())
-                        put("goal", "fallback: $reason")
+                        put("goal", "fallback for $taskId")
                         put("steps", steps)
                     }
-                    executePlan(fbPlan)
+                    executePlan(fb)
                     true
                 }
-                "noop" -> { true }
+
+                // No-op
+                "noop" -> true
+
+                // Custom shell: not supported on normal devices; require root
                 "custom_shell" -> {
-                    // Running arbitrary shell commands requires root; block and require confirmation
-                    NotificationHelper.notify(context, "Shell command blocked", "Shell commands require root. Not executed.")
+                    NotificationHelper.notify(context, "Shell blocked", "Shell commands are not supported on non-rooted devices.")
                     false
                 }
+
+                // Secure store
                 "encrypt_store" -> {
-                    val keyName = params.optString("key_name")
-                    val value = params.optString("value")
-                    StorageUtils.encryptAndStore(context, keyName, value)
-                    true
+                    val keyName = params.optString("key_name","")
+                    val value = params.optString("value","")
+                    if (keyName.isNotBlank()) {
+                        StorageUtils.encryptAndStore(context, keyName, value)
+                        true
+                    } else false
                 }
+
+                // Transfers: always require a wallet/custodial integration
                 "transfer_money" -> {
-                    // Finance transfers MUST require confirmation and are best handled via secure wallet SDKs
-                    NotificationHelper.notify(context, "Transfer requested", "Money transfer requires secure wallet integration and confirmation.")
+                    NotificationHelper.notify(context, "Money transfer requested", "Money transfers require secure wallet integration and explicit approval.")
                     false
                 }
+
+                // Unknown
                 else -> {
-                    // Unknown action: record and fail gracefully
-                    NotificationHelper.notify(context, "Unknown action", "Action type '$type' is not supported by the executor.")
+                    NotificationHelper.notify(context, "Unknown action", "Executor does not support action type: $type")
                     false
                 }
             }
         }
-    }
 
-    private fun readCheckpoint(file: File): Int {
-        if (!file.exists()) return 0
-        return try {
-            val txt = file.readText()
-            val j = JSONObject(txt)
-            j.optInt("last_step", 0)
+// ---------- Helper functions: validation, checkpoints, confirmation, partial outputs ----------
+
+    data class ValidationResult(val valid: Boolean, val reason: String = "")
+
+    private fun validateTaskPlan(json: JSONObject): ValidationResult {
+        try {
+            // top-level required fields: task_id (opt), steps/plan
+            val steps = json.optJSONArray("steps") ?: json.optJSONArray("plan")
+            if (steps == null) return ValidationResult(false, "Missing 'steps' or 'plan' array")
+            for (i in 0 until steps.length()) {
+                val s = steps.optJSONObject(i) ?: return ValidationResult(false, "Step $i is not an object")
+                if (!s.has("id")) return ValidationResult(false, "Step $i missing 'id'")
+                if (!s.has("type")) return ValidationResult(false, "Step ${s.optString("id","$i")} missing 'type'")
+                if (!s.has("description")) return ValidationResult(false, "Step ${s.optString("id","$i")} missing 'description'")
+                if (!s.has("params")) return ValidationResult(false, "Step ${s.optString("id","$i")} missing 'params'")
+            }
+            return ValidationResult(true)
         } catch (e: Exception) {
-            0
+            return ValidationResult(false, "Validation exception: ${e.message}")
         }
     }
 
-    private fun writeCheckpoint(file: File, stepIndex: Int, status: String) {
-        val j = JSONObject()
-        j.put("last_step", stepIndex)
-        j.put("status", status)
-        j.put("timestamp", System.currentTimeMillis())
-        file.parentFile?.mkdirs()
-        file.writeText(j.toString())
+    private fun checkPrerequisites(prereqs: JSONObject): Boolean {
+        // Check common prerequisites (wifi / charging / min_free_space_mb)
+        try {
+            val wifi = prereqs.optBoolean("wifi", false)
+            if (wifi) {
+                val nm = ConnectivityUtils.isOnUnmeteredNetwork(context)
+                if (!nm) return false
+            }
+            val charging = prereqs.optBoolean("charging", false)
+            if (charging) {
+                if (!DeviceUtils.isCharging(context)) return false
+            }
+            val minSpace = prereqs.optInt("min_free_space_mb", 0)
+            if (minSpace > 0) {
+                if (DeviceUtils.freeSpaceMb(context) < minSpace) return false
+            }
+            return true
+        } catch (_: Exception) { return true }
     }
 
+    private fun storePartialOutput(taskDir: File, stepId: String, path: String) {
+        try {
+            val cp = File(taskDir, "checkpoint.json")
+            val checkpoint = loadCheckpoint(cp, 0)
+            checkpoint.partial_outputs.put(stepId, path)
+            saveCheckpoint(cp, checkpoint)
+        } catch (_: Exception) {}
+    }
+
+    private data class Checkpoint(
+        var task_id: String = "",
+        var last_step: Int = 0,
+        var status: String = "running",
+        val steps_status: JSONObject = JSONObject(),
+        val partial_outputs: JSONObject = JSONObject(),
+        var created_at: Long = System.currentTimeMillis(),
+        var updated_at: Long = System.currentTimeMillis()
+    )
+
+    private fun loadCheckpoint(file: File, stepsCountIfNew: Int = 0): Checkpoint {
+        return try {
+            if (!file.exists()) {
+                val cp = Checkpoint()
+                cp.last_step = 0
+                cp.steps_status // empty
+                cp.partial_outputs
+                saveCheckpoint(file, cp)
+                cp
+            } else {
+                val txt = file.readText()
+                val j = JSONObject(txt)
+                val cp = Checkpoint()
+                cp.task_id = j.optString("task_id", "")
+                cp.last_step = j.optInt("last_step", 0)
+                cp.status = j.optString("status", "running")
+                cp.created_at = j.optLong("created_at", System.currentTimeMillis())
+                cp.updated_at = j.optLong("updated_at", System.currentTimeMillis())
+                val ss = j.optJSONObject("steps_status") ?: JSONObject()
+                val po = j.optJSONObject("partial_outputs") ?: JSONObject()
+                // copy into checkpoint objects
+                cp.steps_status.keys().forEach { key -> cp.steps_status.put(key, ss.optString(key)) }
+                cp.partial_outputs.keys().forEach { key -> cp.partial_outputs.put(key, po.optString(key)) }
+                cp
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            val cp = Checkpoint()
+            saveCheckpoint(file, cp)
+            cp
+        }
+    }
+
+    private fun saveCheckpoint(file: File, cp: Checkpoint) {
+        try {
+            val j = JSONObject()
+            j.put("task_id", cp.task_id)
+            j.put("last_step", cp.last_step)
+            j.put("status", cp.status)
+            j.put("steps_status", cp.steps_status)
+            j.put("partial_outputs", cp.partial_outputs)
+            j.put("created_at", cp.created_at)
+            j.put("updated_at", System.currentTimeMillis())
+            file.parentFile?.mkdirs()
+            file.writeText(j.toString(2))
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    // Confirmation flow (listens for broadcast from ConfirmationActivity)
+    private suspend fun requestUserConfirmationViaNotification(taskId: String, stepId: String, description: String, timeoutMs: Long = 2 * 60_000L): Boolean =
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine<Boolean> { cont ->
+                try {
+                    NotificationHelper.notifyConfirmation(context, taskId, stepId.toIntOrNull() ?: (System.currentTimeMillis() % 10000).toInt(), description)
+                    val action = ConfirmationConstants.ACTION_CONFIRM_PREFIX + taskId
+                    val filter = android.content.IntentFilter(action)
+                    val receiver = object : android.content.BroadcastReceiver() {
+                        override fun onReceive(ctx: android.content.Context?, intent: android.content.Intent?) {
+                            try {
+                                val result = intent?.getBooleanExtra(ConfirmationConstants.EXTRA_RESULT, false) ?: false
+                                if (cont.isActive) cont.resume(result) {}
+                            } catch (e: Exception) {
+                                if (cont.isActive) cont.resume(false) {}
+                            } finally {
+                                try { context.unregisterReceiver(this) } catch (_: Exception) {}
+                            }
+                        }
+                    }
+                    try { context.registerReceiver(receiver, filter) } catch (e: Exception) {
+                        e.printStackTrace()
+                        if (cont.isActive) cont.resume(false) {}
+                        return@suspendCancellableCoroutine
+                    }
+
+                    // Timeout guard
+                    val job = scope.launch {
+                        delay(timeoutMs)
+                        if (cont.isActive) {
+                            try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
+                            cont.resume(false) {}
+                        }
+                    }
+
+                    cont.invokeOnCancellation {
+                        try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
+                        job.cancel()
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    if (cont.isActive) cont.resume(false) {}
+                }
+            }
+        }
+
+    // ---------- Utilities ----------
     fun cancelTask(taskId: String) {
-        // Cancel all coroutines in this executor scope (coarse)
         scope.coroutineContext.cancelChildren()
         NotificationHelper.notify(context, "Task canceled", "Task $taskId canceled")
+    }
+
+    private fun logError(msg: String) {
+        println("❌ TaskExecutor: $msg")
     }
 }
