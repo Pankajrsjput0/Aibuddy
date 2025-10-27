@@ -83,4 +83,37 @@ object OpenRouterClient {
                 }
             })
         }
+
+    suspend fun requestPlanner(
+        context: Context,
+        apiKey: String,
+        prompt: String,
+        model: String = "openai/gpt-4o-mini"
+    ): JSONObject {
+        val response = sendMessage(context, apiKey, prompt, model)
+
+        val choices = response.optJSONArray("choices")
+            ?: throw Exception("No response from OpenRouter")
+
+        if (choices.length() == 0) {
+            throw Exception("Empty response from OpenRouter")
+        }
+
+        val firstChoice = choices.getJSONObject(0)
+        val message = firstChoice.optJSONObject("message")
+            ?: throw Exception("No message in OpenRouter response")
+
+        val content = message.optString("content", "")
+        if (content.isEmpty()) {
+            throw Exception("No content in OpenRouter response")
+        }
+
+        // Try to parse as JSON
+        return try {
+            JSONObject(content)
+        } catch (e: Exception) {
+            // Not JSON, wrap as text
+            JSONObject().put("generated_text", content)
+        }
+    }
 }
