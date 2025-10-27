@@ -1,8 +1,12 @@
 package com.example.aiagent
 
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.Intent
+import android.graphics.Path
 import android.view.accessibility.AccessibilityNodeInfo
+import org.json.JSONObject
 import java.lang.Exception
 
 object AccessibilityController {
