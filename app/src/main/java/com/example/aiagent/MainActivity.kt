@@ -2,6 +2,8 @@ package com.example.aiagent
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.Menu
+import android.view.MenuItem
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import kotlinx.coroutines.*
@@ -50,6 +52,29 @@ class MainActivity : AppCompatActivity() {
                     adapter.updateLastAIMessage("Error: ${e.message}")
                 }
             }
+        }
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu?): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            R.id.menu_settings -> {
+                startActivity(Intent(this, SettingsActivity::class.java))
+                true
+            }
+            R.id.menu_tasks -> {
+                startActivity(Intent(this, TaskViewerActivity::class.java))
+                true
+            }
+            R.id.menu_accessibility -> {
+                startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
         }
     }
 

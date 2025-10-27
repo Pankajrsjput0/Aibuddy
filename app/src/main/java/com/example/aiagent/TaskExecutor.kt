@@ -184,7 +184,8 @@ class TaskExecutor(private val context: Context) {
                 e.printStackTrace()
                 NotificationHelper.notify(context, "Executor error", e.message ?: "Unknown error")
             }
-
+        }
+    }
 
 // ---------- Step executor (suspend) ----------
     private suspend fun executeSingleStep(step: JSONObject, taskDir: File, taskId: String): Boolean =

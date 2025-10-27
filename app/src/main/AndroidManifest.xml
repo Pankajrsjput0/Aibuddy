@@ -24,9 +24,11 @@
         android:allowBackup="true"
         android:label="AI Agent"
         android:icon="@mipmap/ic_launcher"
-        android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+        android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
 
 <activity android:name=".ConfirmationActivity" android:exported="false"/>
+        <activity android:name=".SettingsActivity" android:exported="false"/>
+        <activity android:name=".TaskViewerActivity" android:exported="false"/>
 
         <!-- Main activity -->
         <activity android:name=".MainActivity"
@@ -55,6 +57,8 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config"/>
         </service>
+
+        <receiver android:name=".NotificationActionReceiver" android:exported="false"/>
 
     </application>
 </manifest>
