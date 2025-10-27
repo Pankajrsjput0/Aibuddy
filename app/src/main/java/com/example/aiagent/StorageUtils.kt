@@ -27,4 +27,16 @@ object StorageUtils {
         dir.mkdirs()
         return dir
     }
+
+    fun encryptAndStore(context: Context, keyName: String, value: String) {
+        val masterKey = MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
+        val prefs = EncryptedSharedPreferences.create(
+            context,
+            PREF_FILE,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+        prefs.edit().putString(keyName, value).apply()
+    }
 }
